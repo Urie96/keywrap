@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -15,8 +16,7 @@ import (
 )
 
 type ParsedFlag struct {
-	Cmd    string
-	Args   []string
+	Cmd    []string
 	Keymap map[string]string
 	Hold   bool
 	Input  string
@@ -27,16 +27,14 @@ func parseFlag() ParsedFlag {
 		Keymap: make(map[string]string),
 	}
 	printHelp := func() {
-		log.Println("Usage: keywrap --bind \"ctrl-e:become(nvim a.json)\" -- bat a.json")
-		os.Exit(1)
+		log.Fatal("Usage: keywrap --bind \"ctrl-e:become(nvim a.json)\" -- bat a.json")
 	}
 
 	args := os.Args[1:]
 	for len(args) > 0 {
 		switch args[0] {
 		case "--":
-			parsed.Cmd = args[1]
-			parsed.Args = args[2:]
+			parsed.Cmd = args[1:]
 			args = nil
 		case "--bind":
 			keymap := strings.SplitN(args[1], ":", 2)
@@ -52,52 +50,72 @@ func parseFlag() ParsedFlag {
 			parsed.Input = args[1]
 			args = args[2:]
 		default:
-			parsed.Cmd = args[0]
-			parsed.Args = args[1:]
+			parsed.Cmd = args
 			args = nil
 		}
 	}
-	if parsed.Cmd == "" {
+	if len(parsed.Cmd) == 0 {
 		printHelp()
 	}
 	return parsed
 }
 
-func mainWithReturn() int {
+func collectStdinToFile() *os.File {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return nil
+	}
+	stdinFile, err := os.CreateTemp("", "keywrap-stdin")
+	if err != nil {
+		panic(err)
+	}
+	io.Copy(stdinFile, os.Stdin)
+
+	return stdinFile
+}
+
+func startPty(cmd []string, preInput string) (*exec.Cmd, *os.File) {
+	child := exec.Command(cmd[0], cmd[1:]...)
+	child.Env = os.Environ()
+
+	ptmx, err := pty.Start(child)
+	if err != nil {
+		panic(err)
+	}
+
+	if preInput != "" {
+		_, err = ptmx.Write([]byte(preInput))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	return child, ptmx
+}
+
+func main() {
 	log.SetFlags(0)
 
 	flag := parseFlag()
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		log.Printf("Failed to open /dev/tty: %v", err)
-		return 1
+		panic(err)
 	}
 
-	// 准备要执行的命令
-	child := exec.Command(flag.Cmd, flag.Args...)
-	child.Env = os.Environ()
+	childCmd := flag.Cmd
 
-	// 创建伪终端
-	ptmx, err := pty.Start(child)
-	if err != nil {
-		log.Printf("Failed to start command: %v\n", err)
-		return 1
+	stdinFile := collectStdinToFile()
+	if stdinFile != nil {
+		defer stdinFile.Close()
+		childCmd = append([]string{"bash", "-c", `"$@" <"$0"; rm "$0"`, stdinFile.Name()}, childCmd...)
 	}
+
+	child, ptmx := startPty(childCmd, flag.Input)
 	defer ptmx.Close()
-
-	if flag.Input != "" {
-		_, err = ptmx.Write([]byte(flag.Input))
-		if err != nil {
-			log.Printf("Failed to write input: %v\n", err)
-			return 1
-		}
-	}
 
 	// 设置终端为原始模式，以便直接读取按键
 	oldState, err := term.MakeRaw(int(tty.Fd()))
 	if err != nil {
-		log.Printf("Failed to set terminal to raw mode: %v\n", err)
-		return 1
+		panic(err)
 	}
 	defer term.Restore(int(tty.Fd()), oldState)
 
@@ -189,7 +207,7 @@ func mainWithReturn() int {
 				log.Printf("Command finished with error: %v\n", err)
 			}
 			if !flag.Hold {
-				return 0
+				return
 			} else {
 				log.Println("Child process exited, but --hold option is set, waiting for input...")
 			}
@@ -201,12 +219,14 @@ func mainWithReturn() int {
 			switch action.Type {
 			case ActionTypeExit:
 				stopChild()
-				return 0
+				return
 			case ActionTypeBecome:
 				stopChild()
-				execSyscall("bash", "-c", action.Arg)
+				arg := strings.ReplaceAll(action.Arg, "__stdin_file__", stdinFile.Name())
+				execSyscall("bash", "-c", arg)
 			case ActionTypeExecute:
-				cmd := exec.Command("bash", "-c", action.Arg)
+				arg := strings.ReplaceAll(action.Arg, "__stdin_file__", stdinFile.Name())
+				cmd := exec.Command("bash", "-c", arg)
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
 				if err := cmd.Run(); err != nil {
@@ -273,18 +293,11 @@ func formatKeymap(keymap map[string]string) map[string]Action {
 func execSyscall(cmd string, args ...string) {
 	binary, lookErr := exec.LookPath(cmd)
 	if lookErr != nil {
-		log.Fatal(lookErr)
+		panic(lookErr)
 	}
 	env := os.Environ()
 	execErr := syscall.Exec(binary, append([]string{binary}, args...), env)
 	if execErr != nil {
-		log.Fatal(execErr)
-	}
-}
-
-func main() {
-	code := mainWithReturn()
-	if code != 0 {
-		os.Exit(code)
+		panic(execErr)
 	}
 }

@@ -60,6 +60,7 @@ keywrap [OPTIONS] -- <command> [args...]
    - If a mapping exists, the corresponding action is triggered.
    - Otherwise the key is forwarded transparently to the child.
 4. When the child exits, `keywrap` either quits or waits (`--hold`) depending on flags.
+5. If stdin is **not** a terminal (e.g. `cat file | keywrap …`), `keywrap` transparently buffers the data into a temporary file and redirects it to the child process.
 
 ---
 
